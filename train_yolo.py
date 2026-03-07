@@ -96,10 +96,8 @@ parser.add_argument('--debug_steps', default=100, type=int,
 parser.add_argument('--use_cuda', default=True, type=str2bool,
                     help='Use CUDA to train model')
 
-parser.add_argument('--checkpoint_folder', default='models/',
+parser.add_argument('--checkpoint_folder', default='models/rfb_960x960',
                     help='Directory for saving checkpoint models')
-parser.add_argument('--log_dir', default='./models/Ultra-Light(1MB)_&_Fast_Face_Detector/logs',
-                    help='lod dir')
 parser.add_argument('--cuda_index', default="0", type=str,
                     help='Choose cuda index.If you have 4 GPUs, you can set it like 0,1,2,3')
 parser.add_argument('--power', default=2, type=int,
