@@ -8,61 +8,31 @@ import os
 import sys
 import numpy as np
 from scipy.io import loadmat
+from tqdm import tqdm
 
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 from torch.utils.data import DataLoader, ConcatDataset
 
-def bbox_overlaps(boxes1, boxes2):
-    """
-    Calculate the IoU between two sets of boxes
-    Args:
-        boxes1: (N, 4) tensor or numpy array, each box is [x1, y1, x2, y2]
-        boxes2: (M, 4) tensor or numpy array, each box is [x1, y1, x2, y2]
-    Returns:
-        overlaps: (N, M) tensor or numpy array, IoU of each pair of boxes
-    """
-    # Convert to numpy arrays if they are tensors
-    if hasattr(boxes1, 'numpy'):
-        boxes1 = boxes1.numpy()
-    if hasattr(boxes2, 'numpy'):
-        boxes2 = boxes2.numpy()
-    
-    # Calculate area of each box
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    
-    # Calculate intersection
-    x1 = np.maximum(boxes1[:, None, 0], boxes2[:, 0])
-    y1 = np.maximum(boxes1[:, None, 1], boxes2[:, 1])
-    x2 = np.minimum(boxes1[:, None, 2], boxes2[:, 2])
-    y2 = np.minimum(boxes1[:, None, 3], boxes2[:, 3])
-    
-    # Calculate intersection area
-    intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-    
-    # Calculate union area
-    union = area1[:, None] + area2 - intersection
-    
-    # Calculate IoU
-    overlaps = intersection / union
-    
-    return overlaps
-
 from vision.datasets.voc_dataset import VOCDataset
 from vision.datasets.yolo_dataset import YOLODataset
 from vision.nn.multibox_loss import MultiboxLoss
+from vision.ssd.config import fd_config
 from vision.ssd.config.fd_config import define_img_size
+from vision.ssd.data_preprocessing import TrainAugmentation, TestTransform
+from vision.ssd.mb_tiny_RFB_fd import create_Mb_Tiny_RFB_fd
+from vision.ssd.mb_tiny_fd import create_mb_tiny_fd
+from vision.ssd.ssd import MatchPrior
 from vision.utils.misc import str2bool, Timer, freeze_net_layers, store_labels
 
 parser = argparse.ArgumentParser(
     description='train With Pytorch')
 
-parser.add_argument("--dataset_type", default="voc", type=str,
+parser.add_argument("--dataset_type", default="yolo", type=str,
                     help='Specify dataset type. Currently support voc, yolo.')
 
-parser.add_argument('--yolo_data_yaml', default=None, type=str,
+parser.add_argument('--yolo_data_yaml', default="/home/share_4T/workspace/algorithm/det/YOLO/data_20260209_001613/data.yaml", type=str,
                     help='Path to YOLO data.yaml configuration file')
 
 parser.add_argument('--balance_data', action='store_true',
@@ -109,13 +79,17 @@ parser.add_argument('--t_max', default=120, type=float,
                     help='T_max value for Cosine Annealing Scheduler.')
 
 # Train params
-parser.add_argument('--batch_size', default=24, type=int,
+parser.add_argument('--batch_size', default=100, type=int,
                     help='Batch size for training')
 parser.add_argument('--num_epochs', default=300, type=int,
                     help='the number epochs')
 parser.add_argument('--num_workers', default=8, type=int,
                     help='Number of workers used in dataloading')
-parser.add_argument('--validation_epochs', default=5, type=int,
+parser.add_argument('--val_batch_size', default=None, type=int,
+                    help='Batch size for validation (default: same as training batch_size)')
+parser.add_argument('--prefetch_factor', default=4, type=int,
+                    help='Number of batches to prefetch for dataloader')
+parser.add_argument('--validation_epochs', default=1, type=int,
                     help='the number epochs')
 parser.add_argument('--debug_steps', default=100, type=int,
                     help='Set the debug log output frequency.')
@@ -126,16 +100,16 @@ parser.add_argument('--checkpoint_folder', default='models/',
                     help='Directory for saving checkpoint models')
 parser.add_argument('--log_dir', default='./models/Ultra-Light(1MB)_&_Fast_Face_Detector/logs',
                     help='lod dir')
-parser.add_argument('--cuda_index', default="0,1,2,3", type=str,
+parser.add_argument('--cuda_index', default="1", type=str,
                     help='Choose cuda index.If you have 4 GPUs, you can set it like 0,1,2,3')
 parser.add_argument('--power', default=2, type=int,
                     help='poly lr pow')
 parser.add_argument('--overlap_threshold', default=0.35, type=float,
                     help='overlap_threshold')
-parser.add_argument('--optimizer_type', default="SGD", type=str,
-                    help='optimizer_type')
-parser.add_argument('--input_size', default=640, type=int,
-                    help='define network input size,default optional value 128/160/320/480/640/1280')
+parser.add_argument('--optimizer_type', default="Adam", type=str,
+                    help='optimizer_type,optional(SGD,Adam)')
+parser.add_argument('--input_size', default=960, type=int,
+                    help='define network input size,default optional value 128/160/320/480/640/720/960/1280')
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -152,18 +126,51 @@ input_img_size = args.input_size  # define input size ,default optional(128/160/
 logging.info("inpu size :{}".format(input_img_size))
 define_img_size(input_img_size)  # must put define_img_size() before 'import fd_config'
 
-from vision.ssd.config import fd_config
-from vision.ssd.data_preprocessing import TrainAugmentation, TestTransform
-from vision.ssd.mb_tiny_RFB_fd import create_Mb_Tiny_RFB_fd
-from vision.ssd.mb_tiny_fd import create_mb_tiny_fd
-from vision.ssd.ssd import MatchPrior
-
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() and args.use_cuda else "cpu")
-
+# Set device based on cuda_index argument
 if args.use_cuda and torch.cuda.is_available():
+    cuda_index_list = [int(v.strip()) for v in args.cuda_index.split(",")]
+    DEVICE = torch.device(f"cuda:{cuda_index_list[0]}")
     torch.backends.cudnn.benchmark = True
-    logging.info("Use Cuda.")
+    logging.info(f"Use Cuda: {DEVICE}")
+else:
+    DEVICE = torch.device("cpu")
+    logging.info("Use CPU")
 
+def bbox_overlaps(boxes1, boxes2):
+    """
+    Calculate the IoU between two sets of boxes
+    Args:
+        boxes1: (N, 4) tensor or numpy array, each box is [x1, y1, x2, y2]
+        boxes2: (M, 4) tensor or numpy array, each box is [x1, y1, x2, y2]
+    Returns:
+        overlaps: (N, M) tensor or numpy array, IoU of each pair of boxes
+    """
+    # Convert to numpy arrays if they are tensors
+    if hasattr(boxes1, 'numpy'):
+        boxes1 = boxes1.numpy()
+    if hasattr(boxes2, 'numpy'):
+        boxes2 = boxes2.numpy()
+    
+    # Calculate area of each box
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    
+    # Calculate intersection
+    x1 = np.maximum(boxes1[:, None, 0], boxes2[:, 0])
+    y1 = np.maximum(boxes1[:, None, 1], boxes2[:, 1])
+    x2 = np.minimum(boxes1[:, None, 2], boxes2[:, 2])
+    y2 = np.minimum(boxes1[:, None, 3], boxes2[:, 3])
+    
+    # Calculate intersection area
+    intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    
+    # Calculate union area
+    union = area1[:, None] + area2 - intersection
+    
+    # Calculate IoU
+    overlaps = intersection / union
+    
+    return overlaps
 
 def lr_poly(base_lr, iter):
     return base_lr * ((1 - float(iter) / args.num_epochs) ** (args.power))
@@ -180,8 +187,11 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
     running_loss = 0.0
     running_regression_loss = 0.0
     running_classification_loss = 0.0
-    for i, data in enumerate(loader):
-        print(".", end="", flush=True)
+    
+    # Use tqdm progress bar
+    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch}")
+    
+    for i, data in pbar:
         images, boxes, labels = data
         images = images.to(device)
         boxes = boxes.to(device)
@@ -189,7 +199,7 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
 
         optimizer.zero_grad()
         confidence, locations = net(images)
-        regression_loss, classification_loss = criterion(confidence, locations, labels, boxes)  # TODO CHANGE BOXES
+        regression_loss, classification_loss = criterion(confidence, locations, labels, boxes)
         loss = regression_loss + classification_loss
         loss.backward()
         optimizer.step()
@@ -197,11 +207,17 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
         running_loss += loss.item()
         running_regression_loss += regression_loss.item()
         running_classification_loss += classification_loss.item()
+        
+        # Update progress bar postfix
         if i and i % debug_steps == 0:
-            print(".", flush=True)
             avg_loss = running_loss / debug_steps
             avg_reg_loss = running_regression_loss / debug_steps
             avg_clf_loss = running_classification_loss / debug_steps
+            pbar.set_postfix({
+                'Loss': f'{avg_loss:.4f}',
+                'Reg': f'{avg_reg_loss:.4f}',
+                'Clf': f'{avg_clf_loss:.4f}'
+            })
             logging.info(
                 f"Epoch: {epoch}, Step: {i}, " +
                 f"Average Loss: {avg_loss:.4f}, " +
@@ -212,6 +228,8 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
             running_loss = 0.0
             running_regression_loss = 0.0
             running_classification_loss = 0.0
+    
+    pbar.close()
 
 
 def test(loader, net, criterion, device):
@@ -220,7 +238,11 @@ def test(loader, net, criterion, device):
     running_regression_loss = 0.0
     running_classification_loss = 0.0
     num = 0
-    for _, data in enumerate(loader):
+    
+    # Use tqdm progress bar for validation
+    pbar = tqdm(loader, total=len(loader), desc="Validation (Loss)")
+    
+    for _, data in pbar:
         images, boxes, labels = data
         images = images.to(device)
         boxes = boxes.to(device)
@@ -235,6 +257,15 @@ def test(loader, net, criterion, device):
         running_loss += loss.item()
         running_regression_loss += regression_loss.item()
         running_classification_loss += classification_loss.item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'Loss': f'{running_loss / num:.4f}',
+            'Reg': f'{running_regression_loss / num:.4f}',
+            'Clf': f'{running_classification_loss / num:.4f}'
+        })
+    
+    pbar.close()
     return running_loss / num, running_regression_loss / num, running_classification_loss / num
 
 
@@ -320,7 +351,10 @@ def evaluate_detection(loader, net, device, iou_thresh=0.5):
     all_gt_labels = []
     
     with torch.no_grad():
-        for images, boxes, labels in loader:
+        # Use tqdm progress bar for mAP calculation
+        pbar = tqdm(loader, total=len(loader), desc="Validation (mAP)")
+        
+        for images, boxes, labels in pbar:
             images = images.to(device)
             confidences, locations = net(images)
             
@@ -373,6 +407,14 @@ def evaluate_detection(loader, net, device, iou_thresh=0.5):
                 valid_gt = gt_labels > 0
                 all_gt_boxes.extend(gt_boxes[valid_gt])
                 all_gt_labels.extend(gt_labels[valid_gt])
+                
+                # Update progress bar with current statistics
+                pbar.set_postfix({
+                    'Preds': len(all_pred_boxes),
+                    'GT': len(all_gt_boxes)
+                })
+        
+        pbar.close()
     
     # Restore original test mode
     if hasattr(net, 'is_test'):
@@ -450,12 +492,15 @@ if __name__ == '__main__':
                               num_workers=args.num_workers,
                               shuffle=True,
                               pin_memory=True,
+                              prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
                               persistent_workers=True if args.num_workers > 0 else False)
         logging.info("Validation dataset size: {}".format(len(val_dataset)))
-        val_loader = DataLoader(val_dataset, args.batch_size,
+        val_batch_size = args.val_batch_size if args.val_batch_size else args.batch_size
+        val_loader = DataLoader(val_dataset, val_batch_size,
                             num_workers=args.num_workers,
                             shuffle=False,
                             pin_memory=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
                             persistent_workers=True if args.num_workers > 0 else False)
     
     elif args.dataset_type == 'voc':
@@ -477,15 +522,18 @@ if __name__ == '__main__':
                               num_workers=args.num_workers,
                               shuffle=True,
                               pin_memory=True,
+                              prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
                               persistent_workers=True if args.num_workers > 0 else False)
         
         val_dataset = VOCDataset(args.validation_dataset, transform=test_transform,
                                  target_transform=target_transform, is_test=True)
         logging.info("validation dataset size: {}".format(len(val_dataset)))
-        val_loader = DataLoader(val_dataset, args.batch_size,
+        val_batch_size = args.val_batch_size if args.val_batch_size else args.batch_size
+        val_loader = DataLoader(val_dataset, val_batch_size,
                             num_workers=args.num_workers,
                             shuffle=False,
                             pin_memory=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
                             persistent_workers=True if args.num_workers > 0 else False)
     
     else:
