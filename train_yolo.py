@@ -85,7 +85,7 @@ parser.add_argument('--num_epochs', default=300, type=int,
                     help='the number epochs')
 parser.add_argument('--num_workers', default=8, type=int,
                     help='Number of workers used in dataloading')
-parser.add_argument('--val_batch_size', default=None, type=int,
+parser.add_argument('--val_batch_size', default=100, type=int,
                     help='Batch size for validation (default: same as training batch_size)')
 parser.add_argument('--prefetch_factor', default=4, type=int,
                     help='Number of batches to prefetch for dataloader')
@@ -100,7 +100,7 @@ parser.add_argument('--checkpoint_folder', default='models/',
                     help='Directory for saving checkpoint models')
 parser.add_argument('--log_dir', default='./models/Ultra-Light(1MB)_&_Fast_Face_Detector/logs',
                     help='lod dir')
-parser.add_argument('--cuda_index', default="1", type=str,
+parser.add_argument('--cuda_index', default="0", type=str,
                     help='Choose cuda index.If you have 4 GPUs, you can set it like 0,1,2,3')
 parser.add_argument('--power', default=2, type=int,
                     help='poly lr pow')
@@ -167,8 +167,8 @@ def bbox_overlaps(boxes1, boxes2):
     # Calculate union area
     union = area1[:, None] + area2 - intersection
     
-    # Calculate IoU
-    overlaps = intersection / union
+    # Calculate IoU with numerical stability
+    overlaps = np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
     
     return overlaps
 
@@ -218,12 +218,6 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
                 'Reg': f'{avg_reg_loss:.4f}',
                 'Clf': f'{avg_clf_loss:.4f}'
             })
-            logging.info(
-                f"Epoch: {epoch}, Step: {i}, " +
-                f"Average Loss: {avg_loss:.4f}, " +
-                f"Average Regression Loss {avg_reg_loss:.4f}, " +
-                f"Average Classification Loss: {avg_clf_loss:.4f}"
-            )
 
             running_loss = 0.0
             running_regression_loss = 0.0
@@ -240,9 +234,9 @@ def test(loader, net, criterion, device):
     num = 0
     
     # Use tqdm progress bar for validation
-    pbar = tqdm(loader, total=len(loader), desc="Validation (Loss)")
+    pbar = tqdm(enumerate(loader), total=len(loader), desc="Validation (Loss)")
     
-    for _, data in pbar:
+    for i, data in pbar:
         images, boxes, labels = data
         images = images.to(device)
         boxes = boxes.to(device)
@@ -266,172 +260,189 @@ def test(loader, net, criterion, device):
         })
     
     pbar.close()
+    
+    # Synchronize to ensure GPU operations are complete
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
     return running_loss / num, running_regression_loss / num, running_classification_loss / num
 
 
-def compute_map(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels, iou_thresh=0.5):
-    """
-    Compute mAP for object detection
-    Args:
-        pred_boxes: list of predicted boxes (N, 4) [x1, y1, x2, y2]
-        pred_labels: list of predicted labels (N,)
-        pred_scores: list of predicted scores (N,)
-        gt_boxes: list of ground truth boxes (M, 4) [x1, y1, x2, y2]
-        gt_labels: list of ground truth labels (M,)
-        iou_thresh: IoU threshold for positive prediction
-    Returns:
-        mAP: mean Average Precision
-    """
-    # Sort predictions by score in descending order
-    sorted_indices = np.argsort(-np.array(pred_scores))
-    pred_boxes = np.array(pred_boxes)[sorted_indices]
-    pred_labels = np.array(pred_labels)[sorted_indices]
-    pred_scores = np.array(pred_scores)[sorted_indices]
-    
-    # Initialize variables
-    true_positives = np.zeros(len(pred_boxes))
-    false_positives = np.zeros(len(pred_boxes))
-    gt_detected = np.zeros(len(gt_boxes))
-    
-    # Iterate over predictions
-    for i, (box, label, score) in enumerate(zip(pred_boxes, pred_labels, pred_scores)):
-        # Find matching ground truth
-        ious = bbox_overlaps(np.array([box]), np.array(gt_boxes))[0]
-        max_iou_idx = np.argmax(ious)
-        max_iou = ious[max_iou_idx]
-        
-        if max_iou >= iou_thresh and gt_labels[max_iou_idx] == label and not gt_detected[max_iou_idx]:
-            true_positives[i] = 1
-            gt_detected[max_iou_idx] = 1
-        else:
-            false_positives[i] = 1
-    
-    # Compute precision and recall
-    cumulative_true_positives = np.cumsum(true_positives)
-    cumulative_false_positives = np.cumsum(false_positives)
-    precision = cumulative_true_positives / (cumulative_true_positives + cumulative_false_positives + 1e-10)
-    recall = cumulative_true_positives / (len(gt_boxes) + 1e-10)
-    
-    # Compute AP using VOC 2012 method
-    mrec = np.concatenate(([0.], recall, [1.]))
-    mpre = np.concatenate(([0.], precision, [0.]))
-    
-    # Compute the precision envelope
+def bbox_iou(box1, box2):
+    if len(box1) == 0 or len(box2) == 0:
+        return np.zeros((len(box1), len(box2)))
+
+    x1 = np.maximum(box1[:, None, 0], box2[:, 0])
+    y1 = np.maximum(box1[:, None, 1], box2[:, 1])
+    x2 = np.minimum(box1[:, None, 2], box2[:, 2])
+    y2 = np.minimum(box1[:, None, 3], box2[:, 3])
+
+    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+
+    union = area1[:, None] + area2 - inter
+
+    return inter / np.clip(union, 1e-6, None)
+
+
+def compute_ap(rec, prec):
+    mrec = np.concatenate(([0.], rec, [1.]))
+    mpre = np.concatenate(([0.], prec, [0.]))
+
     for i in range(mpre.size - 1, 0, -1):
         mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
-    
-    # Compute area under PR curve
-    i = np.where(mrec[1:] != mrec[:-1])[0]
-    ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
-    
-    return ap
+
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+
+    return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
 
 
-def evaluate_detection(loader, net, device, iou_thresh=0.5):
-    """
-    Evaluate detection performance using mAP
-    Args:
-        loader: DataLoader for validation data
-        net: trained model
-        device: device to run on
-        iou_thresh: IoU threshold for positive prediction
-    Returns:
-        mAP: mean Average Precision
-    """
-    # Set model to test mode
+def evaluate_detection(loader, net, device, iou_thresh=0.5, top_k=100):
+
     net.eval()
-    original_is_test = net.is_test if hasattr(net, 'is_test') else False
-    if hasattr(net, 'is_test'):
-        net.is_test = True
-    
-    all_pred_boxes = []
-    all_pred_labels = []
-    all_pred_scores = []
-    all_gt_boxes = []
-    all_gt_labels = []
-    
+
+    if hasattr(net, "module"):
+        num_classes = net.module.num_classes
+    else:
+        num_classes = net.num_classes
+
+    predictions = []
+    gts = []
+
     with torch.no_grad():
-        # Use tqdm progress bar for mAP calculation
-        pbar = tqdm(loader, total=len(loader), desc="Validation (mAP)")
-        
+
+        pbar = tqdm(loader, desc="Validation mAP")
+
         for images, boxes, labels in pbar:
+
             images = images.to(device)
+
             confidences, locations = net(images)
-            
-            # Get predictions
-            for i in range(images.shape[0]):
-                # Get boxes and scores for this image
-                confidence = confidences[i]
-                location = locations[i]
-                
-                # Filter out background and low confidence detections
-                # Assuming background is class 0
-                non_background = confidence[:, 0] < 0.5  # Invert because higher confidence in background means lower in object
-                if non_background.sum() == 0:
-                    # No detections, skip
-                    gt_boxes = boxes[i].cpu().numpy()
-                    gt_labels = labels[i].cpu().numpy()
-                    valid_gt = gt_labels > 0
-                    all_gt_boxes.extend(gt_boxes[valid_gt])
-                    all_gt_labels.extend(gt_labels[valid_gt])
-                    continue
-                
-                # Get scores and labels
-                scores, predicted_labels = torch.max(confidence, dim=1)
-                valid_detections = (predicted_labels > 0) & (scores > 0.01)  # Filter out background and low confidence
-                
-                if valid_detections.sum() == 0:
-                    # No valid detections, skip
-                    gt_boxes = boxes[i].cpu().numpy()
-                    gt_labels = labels[i].cpu().numpy()
-                    valid_gt = gt_labels > 0
-                    all_gt_boxes.extend(gt_boxes[valid_gt])
-                    all_gt_labels.extend(gt_labels[valid_gt])
-                    continue
-                
-                # Get boxes and scores
-                pred_boxes = location[valid_detections].cpu().numpy()
-                pred_labels = predicted_labels[valid_detections].cpu().numpy()
-                pred_scores = scores[valid_detections].cpu().numpy()
-                
-                # Add to lists
-                all_pred_boxes.extend(pred_boxes)
-                all_pred_labels.extend(pred_labels)
-                all_pred_scores.extend(pred_scores)
-                
-                # Add ground truth
-                gt_boxes = boxes[i].cpu().numpy()
-                gt_labels = labels[i].cpu().numpy()
-                
-                # Filter out background labels (assuming 0 is background)
-                valid_gt = gt_labels > 0
-                all_gt_boxes.extend(gt_boxes[valid_gt])
-                all_gt_labels.extend(gt_labels[valid_gt])
-                
-                # Update progress bar with current statistics
-                pbar.set_postfix({
-                    'Preds': len(all_pred_boxes),
-                    'GT': len(all_gt_boxes)
-                })
-        
-        pbar.close()
-    
-    # Restore original test mode
-    if hasattr(net, 'is_test'):
-        net.is_test = original_is_test
-    
-    # Compute mAP
-    if len(all_gt_boxes) == 0:
+
+            batch = images.shape[0]
+
+            for b in range(batch):
+
+                conf = confidences[b]
+                loc = locations[b]
+
+                scores, cls = torch.max(conf, dim=1)
+
+                mask = (cls > 0) & (scores > 0.01)
+
+                scores = scores[mask]
+                cls = cls[mask]
+                loc = loc[mask]
+
+                if scores.shape[0] > 0:
+
+                    scores, order = scores.sort(descending=True)
+                    order = order[:top_k]
+
+                    pred_boxes = loc[order].cpu().numpy()
+                    pred_labels = cls[order].cpu().numpy()
+                    pred_scores = scores[:top_k].cpu().numpy()
+
+                else:
+
+                    pred_boxes = np.zeros((0,4))
+                    pred_labels = np.zeros(0)
+                    pred_scores = np.zeros(0)
+
+                predictions.append((pred_boxes, pred_labels, pred_scores))
+
+                gt_box = boxes[b].cpu().numpy()
+                gt_label = labels[b].cpu().numpy()
+
+                valid = gt_label > 0
+
+                gts.append((gt_box[valid], gt_label[valid]))
+
+    aps = []
+
+    for cls_id in range(1, num_classes):
+
+        tp = []
+        fp = []
+        scores = []
+        total_gt = 0
+
+        for i in range(len(predictions)):
+
+            pred_box, pred_label, pred_score = predictions[i]
+            gt_box, gt_label = gts[i]
+
+            pred_mask = pred_label == cls_id
+            gt_mask = gt_label == cls_id
+
+            pred_box = pred_box[pred_mask]
+            pred_score = pred_score[pred_mask]
+
+            gt_box = gt_box[gt_mask]
+
+            total_gt += len(gt_box)
+
+            if len(pred_box) == 0:
+                continue
+
+            scores.extend(pred_score)
+
+            if len(gt_box) == 0:
+
+                fp.extend([1]*len(pred_box))
+                tp.extend([0]*len(pred_box))
+                continue
+
+            ious = bbox_iou(pred_box, gt_box)
+
+            matched = set()
+
+            for j in range(len(pred_box)):
+
+                iou = np.max(ious[j])
+                idx = np.argmax(ious[j])
+
+                if iou >= iou_thresh and idx not in matched:
+
+                    tp.append(1)
+                    fp.append(0)
+                    matched.add(idx)
+
+                else:
+
+                    tp.append(0)
+                    fp.append(1)
+
+        if total_gt == 0:
+            continue
+
+        if len(tp) == 0:
+            aps.append(0)
+            continue
+
+        scores = np.array(scores)
+        tp = np.array(tp)
+        fp = np.array(fp)
+
+        order = np.argsort(-scores)
+
+        tp = tp[order]
+        fp = fp[order]
+
+        tp = np.cumsum(tp)
+        fp = np.cumsum(fp)
+
+        recall = tp / (total_gt + 1e-6)
+        precision = tp / (tp + fp + 1e-6)
+
+        aps.append(compute_ap(recall, precision))
+
+    if len(aps) == 0:
         return 0.0
-    
-    if len(all_pred_boxes) == 0:
-        return 0.0
-    
-    # Compute mAP
-    mAP = compute_map(all_pred_boxes, all_pred_labels, all_pred_scores, 
-                     all_gt_boxes, all_gt_labels, iou_thresh)
-    
-    return mAP
+
+    return float(np.mean(aps))
 
 
 if __name__ == '__main__':
