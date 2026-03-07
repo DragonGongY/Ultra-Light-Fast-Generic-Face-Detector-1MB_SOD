@@ -1,33 +1,42 @@
 """
 This code is used to convert the pytorch model into an onnx format model.
 """
+import argparse
 import sys
 
 import torch.onnx
 
 from vision.ssd.config.fd_config import define_img_size
 
-input_img_size = 320  # define input size ,default optional(128/160/320/480/640/1280)
+parser = argparse.ArgumentParser(description='Convert PyTorch model to ONNX')
+parser.add_argument('--input_size', default=1280, type=int,
+                    help='Input size of the model, must match training size (128/160/320/480/640/1280)')
+parser.add_argument('--model_path', default="models/RFB-Epoch-61-ValLoss-0.5525.pth", type=str,
+                    help='Path to the PyTorch model file')
+parser.add_argument('--net_type', default="RFB", type=str, choices=['slim', 'RFB'],
+                    help='Network type (slim or RFB)')
+parser.add_argument('--output_path', default="models/onnx/ultra-fast-face-detector-1mb-1280.onnx", type=str,
+                    help='Path to save the ONNX model file')
+
+args = parser.parse_args()
+
+input_img_size = args.input_size
 define_img_size(input_img_size)
 from vision.ssd.mb_tiny_RFB_fd import create_Mb_Tiny_RFB_fd
 from vision.ssd.mb_tiny_fd import create_mb_tiny_fd
 
-# net_type = "slim"  # inference faster,lower precision
-net_type = "RFB"  # inference lower,higher precision
+net_type = args.net_type
 
 label_path = "models/voc-model-labels.txt"
 class_names = [name.strip() for name in open(label_path).readlines()]
 num_classes = len(class_names)
 
 if net_type == 'slim':
-    model_path = "models/pretrained/version-slim-320.pth"
-    # model_path = "models/pretrained/version-slim-640.pth"
+    model_path = args.model_path
     net = create_mb_tiny_fd(len(class_names), is_test=True)
 elif net_type == 'RFB':
-    model_path = "models/pretrained/version-RFB-320.pth"
-    # model_path = "models/pretrained/version-RFB-640.pth"
+    model_path = args.model_path
     net = create_Mb_Tiny_RFB_fd(len(class_names), is_test=True)
-
 else:
     print("unsupport network type.")
     sys.exit(1)
@@ -35,9 +44,14 @@ net.load(model_path)
 net.eval()
 net.to("cuda")
 
-model_name = model_path.split("/")[-1].split(".")[0]
-model_path = f"models/onnx/{model_name}.onnx"
+# Set dummy input size based on input_img_size
+img_size_dict = {128: [128, 96],
+                 160: [160, 120],
+                 320: [320, 240],
+                 480: [480, 360],
+                 640: [640, 480],
+                 1280: [1280, 960]}
+h, w = img_size_dict[input_img_size][1], img_size_dict[input_img_size][0]
+dummy_input = torch.randn(1, 3, h, w).to("cuda")
 
-dummy_input = torch.randn(1, 3, 240, 320).to("cuda")
-# dummy_input = torch.randn(1, 3, 480, 640).to("cuda") #if input size is 640*480
-torch.onnx.export(net, dummy_input, model_path, verbose=False, input_names=['input'], output_names=['scores', 'boxes'])
+torch.onnx.export(net, dummy_input, args.output_path, verbose=False, input_names=['input'], output_names=['scores', 'boxes'])
