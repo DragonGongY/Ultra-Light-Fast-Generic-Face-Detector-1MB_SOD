@@ -1,0 +1,3 @@
+/mnt/e/projs/py_projs/Ultra-Light-Fast-Generic-Face-Detector-1MB_SOD/openvino/build/CMakeFiles/rebuild_cache.dir
+/mnt/e/projs/py_projs/Ultra-Light-Fast-Generic-Face-Detector-1MB_SOD/openvino/build/CMakeFiles/edit_cache.dir
+/mnt/e/projs/py_projs/Ultra-Light-Fast-Generic-Face-Detector-1MB_SOD/openvino/build/CMakeFiles/ultraface_dnn.dir

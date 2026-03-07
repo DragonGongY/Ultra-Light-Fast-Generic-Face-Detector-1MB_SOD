@@ -9,13 +9,13 @@ import torch.onnx
 from vision.ssd.config.fd_config import define_img_size
 
 parser = argparse.ArgumentParser(description='Convert PyTorch model to ONNX')
-parser.add_argument('--input_size', default=1280, type=int,
+parser.add_argument('--input_size', default=720, type=int,
                     help='Input size of the model, must match training size (128/160/320/480/640/720/960/1280)')
-parser.add_argument('--model_path', default="models/RFB-Epoch-61-ValLoss-0.5525.pth", type=str,
+parser.add_argument('--model_path', default="models/rfb_720x720/RFB-Epoch-0-mAP-0.0033-ValLoss-1.3267.pth", type=str,
                     help='Path to the PyTorch model file')
 parser.add_argument('--net_type', default="RFB", type=str, choices=['slim', 'RFB'],
                     help='Network type (slim or RFB)')
-parser.add_argument('--output_path', default="models/onnx/ultra-fast-face-detector-1mb-1280.onnx", type=str,
+parser.add_argument('--output_path', default="models/onnx/ultra-fast-face-detector-1mb-720.onnx", type=str,
                     help='Path to save the ONNX model file')
 
 args = parser.parse_args()
