@@ -10,7 +10,7 @@ from vision.ssd.config.fd_config import define_img_size
 
 parser = argparse.ArgumentParser(description='Convert PyTorch model to ONNX')
 parser.add_argument('--input_size', default=1280, type=int,
-                    help='Input size of the model, must match training size (128/160/320/480/640/1280)')
+                    help='Input size of the model, must match training size (128/160/320/480/640/720/960/1280)')
 parser.add_argument('--model_path', default="models/RFB-Epoch-61-ValLoss-0.5525.pth", type=str,
                     help='Path to the PyTorch model file')
 parser.add_argument('--net_type', default="RFB", type=str, choices=['slim', 'RFB'],
