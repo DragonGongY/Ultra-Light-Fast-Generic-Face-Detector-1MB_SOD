@@ -50,6 +50,8 @@ img_size_dict = {128: [128, 96],
                  320: [320, 240],
                  480: [480, 360],
                  640: [640, 480],
+                 720: [720, 540],
+                 960: [960, 720],
                  1280: [1280, 960]}
 h, w = img_size_dict[input_img_size][1], img_size_dict[input_img_size][0]
 dummy_input = torch.randn(1, 3, h, w).to("cuda")
