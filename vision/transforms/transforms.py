@@ -1,12 +1,12 @@
 # from https://github.com/amdegroot/ssd.pytorch
 
 
+import random
 import types
 
 import cv2
 import numpy as np
 import torch
-from numpy import random
 from torchvision import transforms
 
 
@@ -152,7 +152,7 @@ class RandomSaturation(object):
         assert self.lower >= 0, "contrast lower must be non-negative."
 
     def __call__(self, image, boxes=None, labels=None):
-        if random.randint(2):
+        if random.randint(0, 1):
             image[:, :, 1] *= random.uniform(self.lower, self.upper)
 
         return image, boxes, labels
@@ -164,7 +164,7 @@ class RandomHue(object):
         self.delta = delta
 
     def __call__(self, image, boxes=None, labels=None):
-        if random.randint(2):
+        if random.randint(0, 1):
             image[:, :, 0] += random.uniform(-self.delta, self.delta)
             image[:, :, 0][image[:, :, 0] > 360.0] -= 360.0
             image[:, :, 0][image[:, :, 0] < 0.0] += 360.0
@@ -178,8 +178,8 @@ class RandomLightingNoise(object):
                       (2, 0, 1), (2, 1, 0))
 
     def __call__(self, image, boxes=None, labels=None):
-        if random.randint(2):
-            swap = self.perms[random.randint(len(self.perms))]
+        if random.randint(0, 1):
+            swap = self.perms[random.randint(0, len(self.perms) - 1)]
             shuffle = SwapChannels(swap)  # shuffle channels
             image = shuffle(image)
         return image, boxes, labels
@@ -215,7 +215,7 @@ class RandomContrast(object):
 
     # expects float image
     def __call__(self, image, boxes=None, labels=None):
-        if random.randint(2):
+        if random.randint(0, 1):
             alpha = random.uniform(self.lower, self.upper)
             image *= alpha
         return image, boxes, labels
@@ -228,7 +228,7 @@ class RandomBrightness(object):
         self.delta = delta
 
     def __call__(self, image, boxes=None, labels=None):
-        if random.randint(2):
+        if random.randint(0, 1):
             delta = random.uniform(-self.delta, self.delta)
             image += delta
         return image, boxes, labels
@@ -458,7 +458,7 @@ class Expand(object):
         self.mean = mean
 
     def __call__(self, image, boxes, labels):
-        if random.randint(2):
+        if random.randint(0, 1):
             return image, boxes, labels
 
         height, width, depth = image.shape
@@ -484,7 +484,7 @@ class Expand(object):
 class RandomMirror(object):
     def __call__(self, image, boxes, classes):
         _, width, _ = image.shape
-        if random.randint(2):
+        if random.randint(0, 1):
             image = image[:, ::-1]
             boxes = boxes.copy()
             boxes[:, 0::2] = width - boxes[:, 2::-2]
@@ -533,7 +533,7 @@ class PhotometricDistort(object):
     def __call__(self, image, boxes, labels):
         im = image.copy()
         im, boxes, labels = self.rand_brightness(im, boxes, labels)
-        if random.randint(2):
+        if random.randint(0, 1):
             distort = Compose(self.pd[:-1])
         else:
             distort = Compose(self.pd[1:])
