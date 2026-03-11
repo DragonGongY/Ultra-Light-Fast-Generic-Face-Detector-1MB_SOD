@@ -22,8 +22,10 @@ parser.add_argument('--path', default="imgs", type=str,
                     help='imgs dir')
 parser.add_argument('--test_device', default="cuda:0", type=str,
                     help='cuda:0 or cpu')
-parser.add_argument('--video_path', default="/home/linzai/Videos/video/16_1.MP4", type=str,
+parser.add_argument('--video_path', default="/mnt/e/test_video/6/_5.0.7.0_251224_231655-S76球停袋口误判进袋，所有异常/output_stand.mp4", type=str,
                     help='path of video')
+parser.add_argument('--model_path', default="", type=str,
+                    help='path of model')
 args = parser.parse_args()
 
 input_img_size = args.input_size
@@ -48,19 +50,15 @@ candidate_size = args.candidate_size
 threshold = args.threshold
 
 if net_type == 'slim':
-    model_path = "models/pretrained/version-slim-320.pth"
-    # model_path = "models/pretrained/version-slim-640.pth"
     net = create_mb_tiny_fd(len(class_names), is_test=True, device=test_device)
     predictor = create_mb_tiny_fd_predictor(net, candidate_size=candidate_size, device=test_device)
 elif net_type == 'RFB':
-    model_path = "models/pretrained/version-RFB-320.pth"
-    # model_path = "models/pretrained/version-RFB-640.pth"
     net = create_Mb_Tiny_RFB_fd(len(class_names), is_test=True, device=test_device)
     predictor = create_Mb_Tiny_RFB_fd_predictor(net, candidate_size=candidate_size, device=test_device)
 else:
     print("The net type is wrong!")
     sys.exit(1)
-net.load(model_path)
+net.load(args.model_path)
 
 timer = Timer()
 sum = 0
@@ -77,10 +75,10 @@ while True:
     for i in range(boxes.size(0)):
         box = boxes[i, :]
         label = f" {probs[i]:.2f}"
-        cv2.rectangle(orig_image, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 4)
+        cv2.rectangle(orig_image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 4)
 
         # cv2.putText(orig_image, label,
-        #             (box[0], box[1] - 10),
+        #             (int(box[0]), int(box[1]) - 10),
         #             cv2.FONT_HERSHEY_SIMPLEX,
         #             0.5,  # font scale
         #             (0, 0, 255),
