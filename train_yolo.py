@@ -7,7 +7,6 @@ import logging
 import os
 import sys
 import numpy as np
-from scipy.io import loadmat
 from tqdm import tqdm
 
 import torch
@@ -25,6 +24,7 @@ from vision.ssd.mb_tiny_RFB_fd import create_Mb_Tiny_RFB_fd
 from vision.ssd.mb_tiny_fd import create_mb_tiny_fd
 from vision.ssd.ssd import MatchPrior
 from vision.utils.misc import str2bool, Timer, freeze_net_layers, store_labels
+from vision.utils import box_utils
 
 parser = argparse.ArgumentParser(
     description='train With Pytorch')
@@ -181,6 +181,9 @@ def adjust_learning_rate(optimizer, i_iter):
 
 
 def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
+    # Save is_test state before training
+    is_test = getattr(net.module, 'is_test', False) if hasattr(net, 'module') else getattr(net, 'is_test', False)
+    
     net.train(True)
     running_loss = 0.0
     running_regression_loss = 0.0
@@ -222,9 +225,18 @@ def train(loader, net, criterion, optimizer, device, debug_steps=100, epoch=-1):
             running_classification_loss = 0.0
     
     pbar.close()
+    
+    # Restore is_test state after training
+    if hasattr(net, "module"):
+        net.module.is_test = is_test
+    else:
+        net.is_test = is_test
 
 
 def test(loader, net, criterion, device):
+    # Save is_test state before testing
+    is_test = getattr(net.module, 'is_test', False) if hasattr(net, 'module') else getattr(net, 'is_test', False)
+    
     net.eval()
     running_loss = 0.0
     running_regression_loss = 0.0
@@ -263,7 +275,215 @@ def test(loader, net, criterion, device):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     
+    # Restore is_test state after testing
+    if hasattr(net, "module"):
+        net.module.is_test = is_test
+    else:
+        net.is_test = is_test
+    
     return running_loss / num, running_regression_loss / num, running_classification_loss / num
+
+
+def predict_from_outputs(confidence, locations, width, height, priors, center_variance, size_variance,
+                         prob_threshold=0.01, top_k=-1, iou_threshold=0.45, candidate_size=1000,
+                         nms_method=None, sigma=0.5):
+    cpu_device = torch.device("cpu")
+    scores = torch.softmax(confidence, dim=2)[0]
+    boxes = box_utils.convert_locations_to_boxes(
+        locations, priors, center_variance, size_variance
+    )
+    boxes = box_utils.center_form_to_corner_form(boxes)[0]
+    boxes = boxes.to(cpu_device)
+    scores = scores.to(cpu_device)
+    picked_box_probs = []
+    picked_labels = []
+    for class_index in range(1, scores.size(1)):
+        probs = scores[:, class_index]
+        mask = probs > prob_threshold
+        probs = probs[mask]
+        if probs.size(0) == 0:
+            continue
+        subset_boxes = boxes[mask, :]
+        box_probs = torch.cat([subset_boxes, probs.reshape(-1, 1)], dim=1)
+        box_probs = box_utils.nms(box_probs, nms_method,
+                                  score_threshold=prob_threshold,
+                                  iou_threshold=iou_threshold,
+                                  sigma=sigma,
+                                  top_k=top_k,
+                                  candidate_size=candidate_size)
+        picked_box_probs.append(box_probs)
+        picked_labels.extend([class_index] * box_probs.size(0))
+    if not picked_box_probs:
+        return (np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0,), dtype=np.float32))
+    picked_box_probs = torch.cat(picked_box_probs)
+    picked_box_probs[:, 0] *= width
+    picked_box_probs[:, 1] *= height
+    picked_box_probs[:, 2] *= width
+    picked_box_probs[:, 3] *= height
+    return (picked_box_probs[:, :4].numpy(),
+            np.array(picked_labels, dtype=np.int64),
+            picked_box_probs[:, 4].numpy())
+
+
+def calculate_map_from_predictions(predictions, gts, num_classes, iou_thresh=0.5):
+    aps = []
+    for cls_id in range(1, num_classes):
+        tp = []
+        fp = []
+        scores = []
+        total_gt = 0
+        for i in range(len(predictions)):
+            pred_boxes, pred_labels, pred_scores = predictions[i]
+            gt_boxes, gt_labels = gts[i]
+            pred_mask = pred_labels == cls_id
+            gt_mask = gt_labels == cls_id
+            pred_boxes = pred_boxes[pred_mask]
+            pred_scores = pred_scores[pred_mask]
+            gt_boxes = gt_boxes[gt_mask]
+            total_gt += len(gt_boxes)
+            if len(pred_boxes) == 0:
+                continue
+            scores.extend(pred_scores)
+            if len(gt_boxes) == 0:
+                fp.extend([1] * len(pred_boxes))
+                tp.extend([0] * len(pred_boxes))
+                continue
+            ious = bbox_iou(pred_boxes, gt_boxes)
+            matched = set()
+            for j in range(len(pred_boxes)):
+                iou = np.max(ious[j])
+                idx_gt = np.argmax(ious[j])
+                if iou >= iou_thresh and idx_gt not in matched:
+                    tp.append(1)
+                    fp.append(0)
+                    matched.add(idx_gt)
+                else:
+                    tp.append(0)
+                    fp.append(1)
+        if total_gt == 0:
+            continue
+        if len(tp) == 0:
+            aps.append(0)
+            continue
+        scores = np.array(scores)
+        tp = np.array(tp)
+        fp = np.array(fp)
+        order = np.argsort(-scores)
+        tp = tp[order]
+        fp = fp[order]
+        tp = np.cumsum(tp)
+        fp = np.cumsum(fp)
+        recall = tp / (total_gt + 1e-6)
+        precision = tp / (tp + fp + 1e-6)
+        ap = compute_ap(recall, precision)
+        print(f"class {cls_id} AP:", ap)
+        aps.append(ap)
+    mAP = np.mean(aps) if len(aps) else 0
+    print("mAP:", mAP)
+    return mAP
+
+
+def validate_and_evaluate_mAP(dataset, net, criterion, device, priors, center_variance, size_variance,
+                              threshold=0.01, candidate_size=200, iou_thresh=0.5, batch_size=1):
+    is_test = getattr(net.module, 'is_test', False) if hasattr(net, 'module') else getattr(net, 'is_test', False)
+    net.eval()
+    running_loss = 0.0
+    running_regression_loss = 0.0
+    running_classification_loss = 0.0
+    num = 0
+    predictions = []
+    gts = []
+    total = len(dataset)
+    pbar = tqdm(range(0, total, batch_size), desc="Validation (Loss/mAP)")
+    for start_idx in pbar:
+        end_idx = min(start_idx + batch_size, total)
+        batch_images = []
+        batch_boxes = []
+        batch_labels = []
+        batch_sizes = []
+        batch_gts = []
+        for idx in range(start_idx, end_idx):
+            image_id = dataset.ids[idx]
+            image = dataset._read_image(image_id)
+            if image is None:
+                continue
+            h, w = image.shape[:2]
+            if isinstance(dataset, VOCDataset):
+                gt_boxes, gt_labels, is_difficult = dataset._get_annotation(image_id)
+                if not dataset.keep_difficult:
+                    gt_boxes = gt_boxes[is_difficult == 0]
+                    gt_labels = gt_labels[is_difficult == 0]
+            else:
+                gt_boxes, gt_labels = dataset._get_annotation(image_id, image)
+            if len(gt_boxes) == 0:
+                gt_boxes = np.zeros((0, 4), dtype=np.float32)
+                gt_labels = np.zeros((0,), dtype=np.int64)
+            gt_boxes_for_map = np.array(gt_boxes, copy=True)
+            gt_labels_for_map = np.array(gt_labels, copy=True)
+            if dataset.transform:
+                image, boxes, labels = dataset.transform(image, gt_boxes, gt_labels)
+            else:
+                image = torch.from_numpy(image).permute(2, 0, 1).float()
+                boxes = torch.from_numpy(gt_boxes)
+                labels = torch.from_numpy(gt_labels)
+            if dataset.target_transform:
+                boxes, labels = dataset.target_transform(boxes, labels)
+            if not torch.is_tensor(boxes):
+                boxes = torch.from_numpy(np.array(boxes))
+            if not torch.is_tensor(labels):
+                labels = torch.from_numpy(np.array(labels))
+            if not torch.is_tensor(image):
+                image = torch.from_numpy(np.array(image))
+            batch_images.append(image)
+            batch_boxes.append(boxes)
+            batch_labels.append(labels)
+            batch_sizes.append((w, h))
+            batch_gts.append((gt_boxes_for_map, gt_labels_for_map))
+        if not batch_images:
+            continue
+        images = torch.stack(batch_images, dim=0).to(device)
+        boxes = torch.stack(batch_boxes, dim=0).to(device)
+        labels = torch.stack(batch_labels, dim=0).to(device)
+        num += images.size(0)
+        with torch.no_grad():
+            confidence, locations = net(images)
+            regression_loss, classification_loss = criterion(confidence, locations, labels, boxes)
+            loss = regression_loss + classification_loss
+        running_loss += loss.item()
+        running_regression_loss += regression_loss.item()
+        running_classification_loss += classification_loss.item()
+        pbar.set_postfix({
+            'Loss': f'{running_loss / num:.4f}',
+            'Reg': f'{running_regression_loss / num:.4f}',
+            'Clf': f'{running_classification_loss / num:.4f}'
+        })
+        for b in range(images.size(0)):
+            w, h = batch_sizes[b]
+            pred_boxes, pred_labels, pred_scores = predict_from_outputs(
+                confidence[b:b + 1], locations[b:b + 1], w, h, priors, center_variance, size_variance,
+                prob_threshold=threshold,
+                top_k=candidate_size // 2,
+                iou_threshold=0.45,
+                candidate_size=1000,
+                sigma=0.5
+            )
+            predictions.append((pred_boxes, pred_labels, pred_scores))
+            gts.append(batch_gts[b])
+    pbar.close()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if hasattr(net, "module"):
+        net.module.is_test = is_test
+    else:
+        net.is_test = is_test
+    val_loss = running_loss / num
+    val_reg_loss = running_regression_loss / num
+    val_clf_loss = running_classification_loss / num
+    num_classes = len(dataset.class_names)
+    val_map = calculate_map_from_predictions(predictions, gts, num_classes, iou_thresh)
+    return val_loss, val_reg_loss, val_clf_loss, val_map
 
 
 def bbox_iou(box1, box2):
@@ -285,6 +505,54 @@ def bbox_iou(box1, box2):
     return inter / np.clip(union, 1e-6, None)
 
 
+def nms(boxes, scores, iou_threshold=0.5):
+    """
+    Non-Maximum Suppression
+    Args:
+        boxes: numpy array of shape (N, 4) in [x1, y1, x2, y2] format
+        scores: numpy array of shape (N,)
+        iou_threshold: IoU threshold for suppression
+    Returns:
+        indices of boxes to keep
+    """
+    if len(boxes) == 0:
+        return np.array([], dtype=np.int64)
+    
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]  # Sort by confidence descending
+    
+    keep = []
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        
+        if len(order) == 1:
+            break
+        
+        # Compute IoU of the kept box with the rest
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        inter = w * h
+        
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        
+        # Keep only boxes with IoU less than threshold
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    
+    return np.array(keep, dtype=np.int64)
+
+
 def compute_ap(rec, prec):
     mrec = np.concatenate(([0.], rec, [1.]))
     mpre = np.concatenate(([0.], prec, [0.]))
@@ -295,152 +563,6 @@ def compute_ap(rec, prec):
     idx = np.where(mrec[1:] != mrec[:-1])[0]
 
     return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-
-
-def evaluate_detection(loader, net, device, iou_thresh=0.5, top_k=100):
-
-    net.eval()
-
-    if hasattr(net, "module"):
-        num_classes = net.module.num_classes
-    else:
-        num_classes = net.num_classes
-
-    predictions = []
-    gts = []
-
-    with torch.no_grad():
-
-        pbar = tqdm(loader, desc="Validation mAP")
-
-        for images, boxes, labels in pbar:
-
-            images = images.to(device)
-
-            confidences, locations = net(images)
-
-            batch = images.shape[0]
-
-            for b in range(batch):
-
-                conf = confidences[b]
-                loc = locations[b]
-
-                scores, cls = torch.max(conf, dim=1)
-
-                mask = (cls > 0) & (scores > 0.01)
-
-                scores = scores[mask]
-                cls = cls[mask]
-                loc = loc[mask]
-
-                if scores.shape[0] > 0:
-
-                    scores, order = scores.sort(descending=True)
-                    order = order[:top_k]
-
-                    pred_boxes = loc[order].cpu().numpy()
-                    pred_labels = cls[order].cpu().numpy()
-                    pred_scores = scores[:top_k].cpu().numpy()
-
-                else:
-
-                    pred_boxes = np.zeros((0,4))
-                    pred_labels = np.zeros(0)
-                    pred_scores = np.zeros(0)
-
-                predictions.append((pred_boxes, pred_labels, pred_scores))
-
-                gt_box = boxes[b].cpu().numpy()
-                gt_label = labels[b].cpu().numpy()
-
-                valid = gt_label > 0
-
-                gts.append((gt_box[valid], gt_label[valid]))
-
-    aps = []
-
-    for cls_id in range(1, num_classes):
-
-        tp = []
-        fp = []
-        scores = []
-        total_gt = 0
-
-        for i in range(len(predictions)):
-
-            pred_box, pred_label, pred_score = predictions[i]
-            gt_box, gt_label = gts[i]
-
-            pred_mask = pred_label == cls_id
-            gt_mask = gt_label == cls_id
-
-            pred_box = pred_box[pred_mask]
-            pred_score = pred_score[pred_mask]
-
-            gt_box = gt_box[gt_mask]
-
-            total_gt += len(gt_box)
-
-            if len(pred_box) == 0:
-                continue
-
-            scores.extend(pred_score)
-
-            if len(gt_box) == 0:
-
-                fp.extend([1]*len(pred_box))
-                tp.extend([0]*len(pred_box))
-                continue
-
-            ious = bbox_iou(pred_box, gt_box)
-
-            matched = set()
-
-            for j in range(len(pred_box)):
-
-                iou = np.max(ious[j])
-                idx = np.argmax(ious[j])
-
-                if iou >= iou_thresh and idx not in matched:
-
-                    tp.append(1)
-                    fp.append(0)
-                    matched.add(idx)
-
-                else:
-
-                    tp.append(0)
-                    fp.append(1)
-
-        if total_gt == 0:
-            continue
-
-        if len(tp) == 0:
-            aps.append(0)
-            continue
-
-        scores = np.array(scores)
-        tp = np.array(tp)
-        fp = np.array(fp)
-
-        order = np.argsort(-scores)
-
-        tp = tp[order]
-        fp = fp[order]
-
-        tp = np.cumsum(tp)
-        fp = np.cumsum(fp)
-
-        recall = tp / (total_gt + 1e-6)
-        precision = tp / (tp + fp + 1e-6)
-
-        aps.append(compute_ap(recall, precision))
-
-    if len(aps) == 0:
-        return 0.0
-
-    return float(np.mean(aps))
 
 
 if __name__ == '__main__':
@@ -549,6 +671,13 @@ if __name__ == '__main__':
         raise ValueError(f"Dataset type {args.dataset_type} is not supported.")
     logging.info("Build network.")
     net = create_net(num_classes)
+    
+    # Set is_test=False for training (model returns locations for loss calculation)
+    # is_test will be set to True before validation for mAP evaluation
+    if hasattr(net, "module"):
+        net.module.is_test = False
+    else:
+        net.is_test = False
 
     # add multigpu_train
     cuda_index_list = None
@@ -665,13 +794,18 @@ if __name__ == '__main__':
             adjust_learning_rate(optimizer, epoch)
         logging.info("lr rate :{}".format(optimizer.param_groups[0]['lr']))
 
-        if epoch % args.validation_epochs == 0 or epoch == args.num_epochs - 1:
-            logging.info("lr rate :{}".format(optimizer.param_groups[0]['lr']))
-            val_loss, val_regression_loss, val_classification_loss = test(val_loader, net, criterion, DEVICE)
-            
-            # Compute mAP
-            val_map = evaluate_detection(val_loader, net, DEVICE)
-            
+        if epoch % args.validation_epochs == 0:
+            priors = config.priors.to(DEVICE)
+            val_loss, val_regression_loss, val_classification_loss, val_map = validate_and_evaluate_mAP(
+                val_dataset,
+                net,
+                criterion,
+                DEVICE,
+                priors,
+                config.center_variance,
+                config.size_variance,
+                batch_size=val_batch_size
+            )
             logging.info(
                 f"Epoch: {epoch}, " +
                 f"Validation Loss: {val_loss:.4f}, " +
