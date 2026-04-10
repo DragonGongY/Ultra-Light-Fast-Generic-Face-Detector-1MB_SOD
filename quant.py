@@ -10,6 +10,7 @@ from typing import List
 import traceback
 import sys
 import types
+import time
 
 import numpy as np
 import torch
@@ -40,6 +41,24 @@ def parse_args():
     parser.add_argument("--iou_threshold", default=0.45, type=float, help="NMS IoU threshold")
     parser.add_argument("--candidate_size", default=1000, type=int, help="NMS candidate size")
     parser.add_argument("--device", default="CPU", type=str, help="OpenVINO device for eval")
+    parser.add_argument("--max_map_drop", default=0.005, type=float, help="Max allowed mAP drop (FP32-INT8)")
+    parser.add_argument("--strict_accuracy", action="store_true", help="Fail and skip saving INT8 when mAP drop exceeds threshold")
+    parser.add_argument("--benchmark_samples", default=200, type=int, help="Frames/samples for latency benchmark")
+    parser.add_argument("--warmup_samples", default=20, type=int, help="Warmup samples before benchmark")
+    parser.add_argument("--quant_mode", default="auto", choices=["auto", "performance", "mixed"], help="INT8 quantization mode")
+    parser.add_argument("--benchmark_infer_only", action="store_true", help="Benchmark only inference time (exclude preprocess)")
+    parser.add_argument("--fp32_perf_hint", default="LATENCY", choices=["LATENCY", "THROUGHPUT"], help="OpenVINO PERFORMANCE_HINT for FP32 model")
+    parser.add_argument("--int8_perf_hint", default="LATENCY", choices=["LATENCY", "THROUGHPUT"], help="OpenVINO PERFORMANCE_HINT for INT8 model")
+    parser.add_argument("--fp32_num_streams", default="1", type=str, help="FP32 NUM_STREAMS (e.g. 1, 2, AUTO)")
+    parser.add_argument("--int8_num_streams", default="1", type=str, help="INT8 NUM_STREAMS (e.g. 1, 2, AUTO)")
+    parser.add_argument("--fp32_threads", default=0, type=int, help="FP32 INFERENCE_NUM_THREADS (0 means default)")
+    parser.add_argument("--int8_threads", default=0, type=int, help="INT8 INFERENCE_NUM_THREADS (0 means default)")
+    parser.add_argument(
+        "--speed_first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prioritize speed for INT8 selection. If true, default to performance mode and skip accuracy gating unless --strict_accuracy is set.",
+    )
     return parser.parse_args()
 
 
@@ -239,6 +258,67 @@ def evaluate_map(compiled_model, dataset, test_transform, max_samples, prob_thre
     return calculate_map(predictions, gts, len(dataset.class_names), iou_thresh=0.5)
 
 
+def benchmark_latency(compiled_model, dataset, test_transform, max_samples, warmup_samples):
+    total = min(len(dataset), max_samples) if max_samples > 0 else len(dataset)
+    warmup = min(total, max(0, warmup_samples))
+    infer_times = []
+
+    for idx in range(total):
+        image, gt_boxes, gt_labels = get_image_and_gt(dataset, idx)
+        img_tensor, _, _ = test_transform(image, gt_boxes.copy(), gt_labels.copy())
+        inp = np.expand_dims(img_tensor.numpy(), axis=0).astype(np.float32)
+        t0 = time.perf_counter()
+        _ = compiled_model([inp])
+        dt = time.perf_counter() - t0
+        if idx >= warmup:
+            infer_times.append(dt)
+
+    if not infer_times:
+        return 0.0, 0.0
+    mean_latency_ms = float(np.mean(infer_times) * 1000.0)
+    fps = float(1.0 / np.mean(infer_times))
+    return mean_latency_ms, fps
+
+
+def build_benchmark_inputs(dataset, test_transform, max_samples):
+    total = min(len(dataset), max_samples) if max_samples > 0 else len(dataset)
+    inputs = []
+    for idx in range(total):
+        image, gt_boxes, gt_labels = get_image_and_gt(dataset, idx)
+        img_tensor, _, _ = test_transform(image, gt_boxes.copy(), gt_labels.copy())
+        inp = np.expand_dims(img_tensor.numpy(), axis=0).astype(np.float32)
+        inputs.append(inp)
+    return inputs
+
+
+def benchmark_latency_infer_only(compiled_model, inputs, warmup_samples):
+    if not inputs:
+        return 0.0, 0.0
+    warmup = min(len(inputs), max(0, warmup_samples))
+    infer_times = []
+    for idx, inp in enumerate(inputs):
+        t0 = time.perf_counter()
+        _ = compiled_model([inp])
+        dt = time.perf_counter() - t0
+        if idx >= warmup:
+            infer_times.append(dt)
+    if not infer_times:
+        return 0.0, 0.0
+    mean_latency_ms = float(np.mean(infer_times) * 1000.0)
+    fps = float(1.0 / np.mean(infer_times))
+    return mean_latency_ms, fps
+
+
+def build_compile_config(perf_hint: str, num_streams: str, num_threads: int):
+    cfg = {
+        "PERFORMANCE_HINT": perf_hint,
+        "NUM_STREAMS": str(num_streams),
+    }
+    if num_threads and num_threads > 0:
+        cfg["INFERENCE_NUM_THREADS"] = str(num_threads)
+    return cfg
+
+
 class CalibrationDataset:
     def __init__(self, dataset, test_transform, subset_size):
         self.dataset = dataset
@@ -431,30 +511,123 @@ def main():
             nncf_calib = nncf.Dataset(calib_dataset, transform_func=lambda item: item)
         except TypeError:
             nncf_calib = nncf.Dataset(calib_dataset)
-    ov_model_int8 = nncf.quantize(
-        ov_model_fp32,
-        calibration_dataset=nncf_calib,
-        preset=nncf.QuantizationPreset.MIXED,
-        subset_size=min(len(calib_dataset), args.calib_subset_size),
-        fast_bias_correction=True,
-    )
-    ov.save_model(ov_model_int8, str(int8_xml), compress_to_fp16=False)
+    # Build quantization candidates:
+    # - PERFORMANCE: faster, usually larger speedup, may lose more accuracy
+    # - MIXED: safer for accuracy
+    candidates = []
+    if args.quant_mode == "auto":
+        candidates = [("performance", nncf.QuantizationPreset.PERFORMANCE), ("mixed", nncf.QuantizationPreset.MIXED)]
+    elif args.quant_mode == "performance":
+        candidates = [("performance", nncf.QuantizationPreset.PERFORMANCE)]
+    else:
+        candidates = [("mixed", nncf.QuantizationPreset.MIXED)]
 
-    logging.info("Step4: evaluate FP32 vs INT8 mAP")
+    logging.info("Step4: compile and select INT8 candidate")
     core = ov.Core()
-    compiled_fp32 = core.compile_model(ov_model_fp32, args.device)
-    compiled_int8 = core.compile_model(ov_model_int8, args.device)
-    fp32_map = evaluate_map(
-        compiled_fp32, val_dataset, test_transform, args.val_max_samples,
-        args.prob_threshold, args.iou_threshold, args.candidate_size,
-    )
-    int8_map = evaluate_map(
-        compiled_int8, val_dataset, test_transform, args.val_max_samples,
-        args.prob_threshold, args.iou_threshold, args.candidate_size,
-    )
-    logging.info("FP32 mAP: %.6f", fp32_map)
-    logging.info("INT8 mAP: %.6f", int8_map)
-    logging.info("mAP drop: %.6f", fp32_map - int8_map)
+    fp32_cfg = build_compile_config(args.fp32_perf_hint, args.fp32_num_streams, args.fp32_threads)
+    int8_cfg = build_compile_config(args.int8_perf_hint, args.int8_num_streams, args.int8_threads)
+    logging.info("FP32 compile config: %s", fp32_cfg)
+    logging.info("INT8 compile config: %s", int8_cfg)
+    compiled_fp32 = core.compile_model(ov_model_fp32, args.device, fp32_cfg)
+
+    best = None
+    evaluate_accuracy = (not args.speed_first) or args.strict_accuracy
+
+    if args.speed_first and not args.strict_accuracy:
+        logging.info("Speed-first mode enabled: using PERFORMANCE preset without accuracy gating.")
+        ov_model_int8 = nncf.quantize(
+            ov_model_fp32,
+            calibration_dataset=nncf_calib,
+            preset=nncf.QuantizationPreset.PERFORMANCE,
+            subset_size=min(len(calib_dataset), args.calib_subset_size),
+            fast_bias_correction=True,
+        )
+        compiled_int8 = core.compile_model(ov_model_int8, args.device, int8_cfg)
+        chosen_mode = "performance-speed-first"
+        int8_map = -1.0
+        map_drop = -1.0
+    else:
+        fp32_map = evaluate_map(
+            compiled_fp32, val_dataset, test_transform, args.val_max_samples,
+            args.prob_threshold, args.iou_threshold, args.candidate_size,
+        )
+
+        for mode_name, preset in candidates:
+            logging.info("Quantizing candidate mode=%s ...", mode_name)
+            ov_model_int8_cand = nncf.quantize(
+                ov_model_fp32,
+                calibration_dataset=nncf_calib,
+                preset=preset,
+                subset_size=min(len(calib_dataset), args.calib_subset_size),
+                fast_bias_correction=True,
+            )
+            compiled_int8_cand = core.compile_model(ov_model_int8_cand, args.device, int8_cfg)
+            int8_map = evaluate_map(
+                compiled_int8_cand, val_dataset, test_transform, args.val_max_samples,
+                args.prob_threshold, args.iou_threshold, args.candidate_size,
+            )
+            map_drop = fp32_map - int8_map
+            logging.info("[%s] INT8 mAP: %.6f, drop: %.6f", mode_name, int8_map, map_drop)
+
+            if map_drop <= args.max_map_drop:
+                best = (mode_name, ov_model_int8_cand, compiled_int8_cand, int8_map, map_drop)
+                break
+
+        if best is None:
+            msg = (
+                f"No INT8 candidate meets max_map_drop={args.max_map_drop:.6f}. "
+                "Try increasing calib_subset_size or relaxing max_map_drop."
+            )
+            if args.strict_accuracy:
+                raise RuntimeError(msg)
+            logging.warning(msg)
+            # fallback to performance when speed_first, else mixed.
+            fallback_preset = nncf.QuantizationPreset.PERFORMANCE if args.speed_first else nncf.QuantizationPreset.MIXED
+            fallback_name = "performance-fallback" if args.speed_first else "mixed-fallback"
+            ov_model_int8 = nncf.quantize(
+                ov_model_fp32,
+                calibration_dataset=nncf_calib,
+                preset=fallback_preset,
+                subset_size=min(len(calib_dataset), args.calib_subset_size),
+                fast_bias_correction=True,
+            )
+            compiled_int8 = core.compile_model(ov_model_int8, args.device, int8_cfg)
+            int8_map = evaluate_map(
+                compiled_int8, val_dataset, test_transform, args.val_max_samples,
+                args.prob_threshold, args.iou_threshold, args.candidate_size,
+            )
+            map_drop = fp32_map - int8_map
+            chosen_mode = fallback_name
+        else:
+            chosen_mode, ov_model_int8, compiled_int8, int8_map, map_drop = best
+
+    if evaluate_accuracy:
+        logging.info("FP32 mAP: %.6f", fp32_map)
+    logging.info("Chosen INT8 mode: %s", chosen_mode)
+    if evaluate_accuracy:
+        logging.info("INT8 mAP: %.6f", int8_map)
+        logging.info("mAP drop: %.6f", map_drop)
+    else:
+        logging.info("Accuracy evaluation skipped due to speed-first mode.")
+
+    logging.info("Step5: benchmark FP32 vs INT8 latency/FPS")
+    if args.benchmark_infer_only:
+        bench_inputs = build_benchmark_inputs(val_dataset, test_transform, args.benchmark_samples)
+        fp32_lat_ms, fp32_fps = benchmark_latency_infer_only(compiled_fp32, bench_inputs, args.warmup_samples)
+        int8_lat_ms, int8_fps = benchmark_latency_infer_only(compiled_int8, bench_inputs, args.warmup_samples)
+    else:
+        fp32_lat_ms, fp32_fps = benchmark_latency(
+            compiled_fp32, val_dataset, test_transform, args.benchmark_samples, args.warmup_samples
+        )
+        int8_lat_ms, int8_fps = benchmark_latency(
+            compiled_int8, val_dataset, test_transform, args.benchmark_samples, args.warmup_samples
+        )
+    speedup = (fp32_lat_ms / int8_lat_ms) if int8_lat_ms > 0 else 0.0
+    logging.info("FP32 latency: %.3f ms, FPS: %.2f", fp32_lat_ms, fp32_fps)
+    logging.info("INT8 latency: %.3f ms, FPS: %.2f", int8_lat_ms, int8_fps)
+    logging.info("INT8 speedup: %.3fx", speedup)
+
+    ov.save_model(ov_model_int8, str(int8_xml), compress_to_fp16=False)
     logging.info("FP32 IR: %s", fp32_xml)
     logging.info("INT8 IR: %s", int8_xml)
 
